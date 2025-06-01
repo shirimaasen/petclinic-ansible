@@ -1,0 +1,152 @@
+---
+- name: Configure LVM-backed /var on /dev/xvdf
+  hosts: petclinic_servers
+  become: true
+
+  vars:
+    lvm_device: /dev/xvdf
+    vg_name: var_vg
+    lv_name: var_lv
+    mount_point: /var
+    temp_mount: /mnt/var_new
+    filesystem: ext4
+    fstab_opts: "defaults 0 2"
+    var_lvm_path: "/dev/{{ vg_name }}/{{ lv_name }}"
+
+  tasks:
+    - name: Ensure LVM tools and rsync are installed
+      dnf:
+        name:
+          - lvm2
+          - rsync
+        state: present
+
+    - name: Wait for {{ lvm_device }} to exist
+      wait_for:
+        path: "{{ lvm_device }}"
+        state: present
+        timeout: 300
+
+    - name: Check if PV already exists on {{ lvm_device }}
+      command: pvs --noheadings -o pv_name
+      register: existing_pvs
+      failed_when: false
+
+    - name: Create PV on {{ lvm_device }} if missing
+      command: pvcreate {{ lvm_device }}
+      when: lvm_device not in existing_pvs.stdout
+      register: pvcreate_out
+      changed_when: "'successfully created physical volume' in pvcreate_out.stdout or pvcreate_out.rc == 0"
+
+    - name: Check if VG {{ vg_name }} exists
+      command: vgs --noheadings -o vg_name
+      register: existing_vgs
+      failed_when: false
+
+    - name: Create VG {{ vg_name }} if missing
+      command: vgcreate {{ vg_name }} {{ lvm_device }}
+      when: vg_name not in existing_vgs.stdout
+      register: vgcreate_out
+      changed_when: "'successfully created volume group' in vgcreate_out.stdout or vgcreate_out.rc == 0"
+
+    - name: Check if LV {{ lv_name }} exists in VG {{ vg_name }}
+      command: lvs --noheadings -o lv_name {{ vg_name }}
+      register: existing_lvs
+      failed_when: false
+
+    - name: Create LV {{ lv_name }} using 100%FREE if missing
+      command: lvcreate -l 100%FREE -n {{ lv_name }} {{ vg_name }}
+      when: lv_name not in existing_lvs.stdout
+      register: lvcreate_out
+      changed_when: "'successfully created logical volume' in lvcreate_out.stdout or lvcreate_out.rc == 0"
+
+    - name: Check if filesystem already exists on {{ var_lvm_path }}
+      command: blkid -o value -s TYPE {{ var_lvm_path }}
+      register: blkid_type
+      failed_when: false
+
+    - name: Format LV as {{ filesystem }} if missing
+      filesystem:
+        fstype: "{{ filesystem }}"
+        dev: "{{ var_lvm_path }}"
+      when: blkid_type.stdout == ""
+
+    - name: Create temporary mount point {{ temp_mount }}
+      file:
+        path: "{{ temp_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check if /var is already on LVM (skip if so)
+      command: findmnt -n -o SOURCE --target {{ mount_point }}
+      register: var_mount_source
+      failed_when: false
+
+    - name: End play if /var is already on {{ var_lvm_path }}
+      meta: end_play
+      when: var_mount_source.stdout is search(var_lvm_path)
+
+    - name: Mount new LV on {{ temp_mount }} temporarily
+      mount:
+        path: "{{ temp_mount }}"
+        src: "{{ var_lvm_path }}"
+        fstype: "{{ filesystem }}"
+        state: mounted
+
+    - name: Rsync existing /var into new LVM volume (run locally on remote)
+      command: rsync -a /var/ {{ temp_mount }}/
+
+    - name: Ensure /etc/fstab entry for {{ mount_point }} exists
+      lineinfile:
+        path: /etc/fstab
+        insertafter: EOF
+        line: "{{ var_lvm_path }}    {{ mount_point }}    {{ filesystem }}    {{ fstab_opts }}"
+      when: var_mount_source.stdout is not search(var_lvm_path)
+
+    - name: Unmount temporary mount {{ temp_mount }}
+      mount:
+        path: "{{ temp_mount }}"
+        state: unmounted
+
+    - name: Rename old /var to /var.old if it exists
+      command: mv {{ mount_point }} {{ mount_point }}.old
+      args:
+        creates: "{{ mount_point }}.old"
+      when:
+        - var_mount_source.stdout != ""
+        - var_lvm_path not in var_mount_source.stdout
+
+    - name: Create fresh mount directory {{ mount_point }}
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Mount LV over {{ mount_point }}
+      mount:
+        path: "{{ mount_point }}"
+        src: "{{ var_lvm_path }}"
+        fstype: "{{ filesystem }}"
+        opts: "defaults"
+        state: mounted
+
+    - name: Quick write-test under {{ mount_point }}
+      file:
+        path: "{{ mount_point }}/touchtest-$(date +%s)"
+        state: touch
+      ignore_errors: true
+
+    - name: Remove temporary directory {{ temp_mount }}
+      file:
+        path: "{{ temp_mount }}"
+        state: absent
+
+    - name: '(Optional) Reminder: remove /var.old after verification'
+      debug:
+        msg: >
+          "/var has been migrated to {{ var_lvm_path }}.
+          Once you confirm log integrity, manually delete /var.old to free space."
