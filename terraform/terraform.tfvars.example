@@ -1,0 +1,12 @@
+aws_region            = "eu-north-1"
+project_name          = "lvm-petclinic"
+environment           = "dev"
+instance_type         = "t3.medium"
+root_volume_size      = 20
+lvm_volume_size       = 10
+lvm_volume_iops       = 3000
+lvm_volume_throughput = 125
+public_key_path       = "~/.ssh/id_rsa.pub"
+allowed_ssh_cidrs     = ["[your IP]/32"]
+use_elastic_ip        = true
+log_retention_days    = 14

@@ -1,0 +1,138 @@
+---
+- name: Deploy Spring PetClinic + Nginx on AL2023
+  hosts: petclinic_servers
+  become: true
+
+  vars:
+    install_dir: "/opt/petclinic"
+    repo_url: "https://github.com/spring-projects/spring-petclinic.git"
+    service_name: "petclinic"
+
+  tasks:
+    - name: Install Java 17, Git and Maven
+      dnf:
+        name:
+          - java-17-amazon-corretto-headless
+          - git
+          - maven
+        state: present
+
+    - name: Create /opt/petclinic directory
+      file:
+        path: "{{ install_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Clone Spring PetClinic repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ install_dir }}/src"
+        version: "main"
+        update: no
+      register: git_clone
+
+    - name: Build Spring PetClinic with Maven
+      shell: mvn -DskipTests package
+      args:
+        chdir: "{{ install_dir }}/src"
+      when: git_clone.changed
+
+    - name: Find the built PetClinic JAR in target/
+      find:
+        paths: "{{ install_dir }}/src/target"
+        patterns: "*.jar"
+        recurse: no
+      register: built_jars
+
+    - name: Fail if no JAR was found
+      fail:
+        msg: "Maven did not produce a JAR in {{ install_dir }}/src/target"
+      when: built_jars.files | length == 0
+
+    - name: Copy the built JAR to /opt/petclinic/petclinic.jar
+      copy:
+        src: "{{ built_jars.files[0].path }}"
+        dest: "{{ install_dir }}/petclinic.jar"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create systemd unit file for PetClinic
+      copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Spring PetClinic Application
+          After=network.target
+
+          [Service]
+          User=root
+          WorkingDirectory={{ install_dir }}
+          ExecStart=/usr/bin/java -jar {{ install_dir }}/petclinic.jar
+          Restart=always
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - daemon-reload
+        - start-petclinic
+
+    - name: Enable and start PetClinic service
+      systemd:
+        name: "{{ service_name }}.service"
+        enabled: true
+        state: started
+
+    - name: Install Nginx
+      dnf:
+        name: nginx
+        state: present
+
+    - name: Create Nginx conf for PetClinic reverse-proxy
+      copy:
+        dest: /etc/nginx/conf.d/petclinic.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen       80;
+              server_name  _;
+              location / {
+                  proxy_pass         http://127.0.0.1:8080;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+              }
+          }
+      notify:
+        - reload-nginx
+
+    - name: Enable and start Nginx
+      systemd:
+        name: nginx
+        enabled: true
+        state: started
+
+  handlers:
+    - name: daemon-reload
+      command: systemctl daemon-reload
+
+    - name: start-petclinic
+      systemd:
+        name: "{{ service_name }}.service"
+        state: started
+        enabled: true
+
+    - name: reload-nginx
+      systemd:
+        name: nginx
+        state: reloaded

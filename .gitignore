@@ -1,0 +1,12 @@
+.terraform*
+prod.tfvars*
+k8s/petclinic.env
+.DS_Store*
+**txt
+**tfstate
+**tfstate.*
+backend.tf*
+tfvars**
+**tfvars
+venv/
+**.backup
